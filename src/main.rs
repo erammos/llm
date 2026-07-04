@@ -142,6 +142,7 @@ impl Module for MultiHeadAttention {
 }
 
 struct TransfomerBlock {
+    att: MultiHeadAttention,
     ff: FeedForward,
     norm1: LayerNorm,
     norm2: LayerNorm,
@@ -160,7 +161,25 @@ impl TransfomerBlock {
             norm1: LayerNorm::new(emb_dim, vs.pp("norm1"))?,
             norm2: LayerNorm::new(emb_dim, vs.pp("norm2"))?,
             drop_shortcut: Dropout::new(dropout),
+            att: MultiHeadAttention::new(emb_dim, emb_dim, context_length, dropout, n_heads, vs)?,
         })
+    }
+}
+impl Module for TransfomerBlock {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let shortcut = &x;
+        let mut x = self.norm1.forward(&x)?;
+        x = self.att.forward(&x)?;
+        x = self.drop_shortcut.forward(&x, true)?;
+        x = x.broadcast_add(shortcut)?;
+
+        let shortcut = &x;
+        let mut x = self.norm2.forward(&x)?;
+        x = self.ff.forward(&x)?;
+        x = self.drop_shortcut.forward(&x, true)?;
+        x = x.broadcast_add(&shortcut)?;
+
+        Ok(x)
     }
 }
 
@@ -189,4 +208,9 @@ pub fn main() {
     let device = Device::Cpu;
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+    let t = Tensor::randn(0.0f32, 1.0f32, (2, 4, 768), &device).unwrap();
+    let transformer =
+        TransfomerBlock::new(emb_dim, context_length, n_heads, drop_rate, vb).unwrap();
+    transformer.forward(&t).unwrap();
 }
