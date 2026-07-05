@@ -1,10 +1,10 @@
 use candle_core::{D, DType, Device, IndexOp, Result, Tensor, Var};
 use candle_nn::{
     Dropout, Embedding, Linear, Module, Sequential, VarBuilder, VarMap, attention::AttnMask,
-    embedding, linear, linear_no_bias, ops::softmax,
+    embedding, linear, linear_no_bias, ops::softmax, seq, sequential,
 };
 use core::f32;
-use std::fs::read_to_string;
+use std::{any::Any, fs::read_to_string};
 use tiktoken_rs::{r50k_base, r50k_base_singleton, tokenizer};
 
 struct LayerNorm {
@@ -106,9 +106,9 @@ impl Module for MultiHeadAttention {
         let keys = keys.reshape((b, num_tokens, self.num_heads, head_dims))?;
         let queries = queries.reshape((b, num_tokens, self.num_heads, head_dims))?;
         let values = values.reshape((b, num_tokens, self.num_heads, head_dims))?;
-        let keys = keys.transpose(1, 2)?;
-        let queries = queries.transpose(1, 2)?;
-        let values = values.transpose(1, 2)?;
+        let keys = keys.transpose(1, 2)?.contiguous()?;
+        let queries = queries.transpose(1, 2)?.contiguous()?;
+        let values = values.transpose(1, 2)?.contiguous()?;
 
         let atten_scores = queries.matmul(&keys.transpose(2, 3)?)?;
         let mask_bool = self.mask.i((..num_tokens, ..num_tokens))?.broadcast_as((
@@ -188,6 +188,79 @@ struct GPTModel {
     pos_emb: Embedding,
     drop_emb: Dropout,
     tranformers: Sequential,
+    final_norm: LayerNorm,
+    out_head: Linear,
+}
+
+impl Module for GPTModel {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let (batch_size, seq_len) = xs.shape().dims2()?;
+        let tok_embeds = self.tok_emb.forward(&xs)?;
+        let pos_embeds = self
+            .pos_emb
+            .forward(&Tensor::arange(0, seq_len as u32, &xs.device())?)?;
+        let mut x = tok_embeds.broadcast_add(&pos_embeds)?;
+        let x = self.drop_emb.forward(&x, true)?;
+        let x = self.tranformers.forward(&x)?;
+        let x = self.final_norm.forward(&x)?;
+        let logits = self.out_head.forward(&x)?;
+        Ok(logits)
+    }
+}
+
+impl GPTModel {
+    pub fn new(
+        vocab_size: usize,
+        context_length: usize,
+        emb_dim: usize,
+        n_heads: usize,
+        n_layers: usize,
+        drop_rate: f32,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let mut seq = seq();
+        for i in 0..n_layers {
+            seq = seq.add(TransfomerBlock::new(
+                emb_dim,
+                context_length,
+                n_heads,
+                drop_rate,
+                vb.pp(format!("transformer {}", i)),
+            )?);
+        }
+        Ok(Self {
+            tok_emb: embedding(vocab_size, emb_dim, vb.pp("tok_emb"))?,
+            pos_emb: embedding(context_length, emb_dim, vb.pp("pos_enb"))?,
+            drop_emb: Dropout::new(drop_rate),
+            tranformers: seq,
+            final_norm: LayerNorm::new(emb_dim, vb.pp("final_norm"))?,
+            out_head: linear_no_bias(emb_dim, vocab_size, vb.pp("out_head"))?,
+        })
+    }
+}
+fn print_total_parameters(varmap: &VarMap) {
+    let mut total_params = 0;
+
+    // Get access to the inner map of named variables
+    let data = varmap.data().lock().unwrap();
+
+    for (name, var) in data.iter() {
+        // Retrieve the shape dimensions of the individual tensor
+        let shape = var.shape();
+        let param_count = shape.elem_count();
+        total_params += param_count;
+
+        println!(
+            "{}: {} elements (shape: {:?}",
+            name,
+            param_count,
+            shape.dims()
+        );
+    }
+
+    println!("\n==========================================");
+    println!("Total Trainable Parameters: {}", total_params);
+    println!("==========================================");
 }
 
 pub fn main() {
@@ -209,8 +282,15 @@ pub fn main() {
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-    let t = Tensor::randn(0.0f32, 1.0f32, (2, 4, 768), &device).unwrap();
-    let transformer =
-        TransfomerBlock::new(emb_dim, context_length, n_heads, drop_rate, vb).unwrap();
-    transformer.forward(&t).unwrap();
+    let gpt = GPTModel::new(
+        vocab_size,
+        context_length,
+        emb_dim,
+        n_heads,
+        n_layers,
+        drop_rate,
+        vb,
+    )
+    .unwrap();
+    print_total_parameters(&varmap);
 }
