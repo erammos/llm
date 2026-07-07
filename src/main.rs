@@ -1,23 +1,25 @@
 use candle_core::{D, DType, Device, IndexOp, Result, Tensor, Var};
 use candle_nn::{
     Dropout, Embedding, Linear, Module, Sequential, VarBuilder, VarMap, attention::AttnMask,
-    embedding, linear, linear_no_bias, ops::softmax, seq, sequential,
+    embedding, layer_norm, linear, linear_no_bias, ops::softmax, seq, sequential,
 };
 use core::f32;
 use std::{any::Any, fs::read_to_string};
 use tiktoken_rs::{r50k_base, r50k_base_singleton, tokenizer};
 
-struct LayerNorm {
+/* struct LayerNorm {
     eps: f64,
     scale: Tensor,
     shift: Tensor,
 }
 impl LayerNorm {
     pub fn new(emb_dim: usize, vs: VarBuilder) -> Result<Self> {
+        let scale = vs.get_with_hints(emb_dim, "scale", candle_nn::Init::Const(1.0))?;
+        let shift = vs.get_with_hints(emb_dim, "shift", candle_nn::Init::Const(0.0))?;
         Ok(Self {
             eps: 1e-5,
-            scale: vs.get(emb_dim, "scale")?,
-            shift: vs.get(emb_dim, "shift")?,
+            scale,
+            shift,
         })
     }
 }
@@ -33,6 +35,8 @@ impl Module for LayerNorm {
         scaled.broadcast_add(&self.shift)
     }
 }
+*/
+
 struct FeedForward {
     l1: Linear,
     l2: Linear,
@@ -64,6 +68,7 @@ struct MultiHeadAttention {
     d_in: usize,
     d_out: usize,
     context_length: usize,
+    train_mode: bool,
 }
 
 impl MultiHeadAttention {
@@ -92,6 +97,7 @@ impl MultiHeadAttention {
             d_out,
             context_length,
             mask,
+            train_mode: false,
         })
     }
 }
@@ -130,7 +136,7 @@ impl Module for MultiHeadAttention {
             &(atten_scores / (keys.dim(D::Minus1)? as f64).sqrt())?,
             D::Minus1,
         )?;
-        let attn_weights = self.dropout.forward(&attn_weights, true)?;
+        let attn_weights = self.dropout.forward(&attn_weights, self.train_mode)?;
         let context_vec = &attn_weights.matmul(&values)?.transpose(1, 2)?;
 
         let context_vec = context_vec
@@ -144,9 +150,10 @@ impl Module for MultiHeadAttention {
 struct TransfomerBlock {
     att: MultiHeadAttention,
     ff: FeedForward,
-    norm1: LayerNorm,
-    norm2: LayerNorm,
+    norm1: candle_nn::LayerNorm,
+    norm2: candle_nn::LayerNorm,
     drop_shortcut: Dropout,
+    train_mode: bool,
 }
 impl TransfomerBlock {
     pub fn new(
@@ -158,10 +165,11 @@ impl TransfomerBlock {
     ) -> Result<Self> {
         Ok(Self {
             ff: FeedForward::new(emb_dim, vs.pp("ff"))?,
-            norm1: LayerNorm::new(emb_dim, vs.pp("norm1"))?,
-            norm2: LayerNorm::new(emb_dim, vs.pp("norm2"))?,
+            norm1: layer_norm(emb_dim, 1e-5, vs.pp("norm1"))?,
+            norm2: layer_norm(emb_dim, 1e-5, vs.pp("norm2"))?,
             drop_shortcut: Dropout::new(dropout),
             att: MultiHeadAttention::new(emb_dim, emb_dim, context_length, dropout, n_heads, vs)?,
+            train_mode: false,
         })
     }
 }
@@ -170,13 +178,13 @@ impl Module for TransfomerBlock {
         let shortcut = &x;
         let mut x = self.norm1.forward(&x)?;
         x = self.att.forward(&x)?;
-        x = self.drop_shortcut.forward(&x, true)?;
+        x = self.drop_shortcut.forward(&x, self.train_mode)?;
         x = x.broadcast_add(shortcut)?;
 
         let shortcut = &x;
         let mut x = self.norm2.forward(&x)?;
         x = self.ff.forward(&x)?;
-        x = self.drop_shortcut.forward(&x, true)?;
+        x = self.drop_shortcut.forward(&x, self.train_mode)?;
         x = x.broadcast_add(&shortcut)?;
 
         Ok(x)
@@ -188,8 +196,9 @@ struct GPTModel {
     pos_emb: Embedding,
     drop_emb: Dropout,
     tranformers: Sequential,
-    final_norm: LayerNorm,
+    final_norm: candle_nn::LayerNorm,
     out_head: Linear,
+    train_mode: bool,
 }
 
 impl Module for GPTModel {
@@ -200,7 +209,7 @@ impl Module for GPTModel {
             .pos_emb
             .forward(&Tensor::arange(0, seq_len as u32, &xs.device())?)?;
         let mut x = tok_embeds.broadcast_add(&pos_embeds)?;
-        let x = self.drop_emb.forward(&x, true)?;
+        let x = self.drop_emb.forward(&x, self.train_mode)?;
         let x = self.tranformers.forward(&x)?;
         let x = self.final_norm.forward(&x)?;
         let logits = self.out_head.forward(&x)?;
@@ -233,8 +242,9 @@ impl GPTModel {
             pos_emb: embedding(context_length, emb_dim, vb.pp("pos_enb"))?,
             drop_emb: Dropout::new(drop_rate),
             tranformers: seq,
-            final_norm: LayerNorm::new(emb_dim, vb.pp("final_norm"))?,
+            final_norm: layer_norm(emb_dim, 1e-5, vb.pp("final_norm"))?,
             out_head: linear_no_bias(emb_dim, vocab_size, vb.pp("out_head"))?,
+            train_mode: false,
         })
     }
 }
@@ -269,8 +279,6 @@ pub fn main() {
     let text = read_to_string("the-verdict.txt").unwrap();
     let tokens = tokenizer.encode_with_special_tokens(&text);
 
-    let l: LayerNorm;
-
     let vocab_size = 50257;
     let context_length = 1024;
     let emb_dim = 768;
@@ -293,4 +301,12 @@ pub fn main() {
     )
     .unwrap();
     print_total_parameters(&varmap);
+    let tokens = tokenizer.encode_with_special_tokens("Hello, I am");
+    let n = tokens.len();
+    let x = Tensor::new(tokens, &device)
+        .unwrap()
+        .reshape((1, n))
+        .unwrap();
+    let s = gpt.forward(&x).unwrap();
+    println!("{}", s);
 }
