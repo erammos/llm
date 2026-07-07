@@ -1,7 +1,8 @@
 use candle_core::{D, DType, Device, IndexOp, Result, Tensor, Var};
 use candle_nn::{
-    Dropout, Embedding, Linear, Module, Sequential, VarBuilder, VarMap, attention::AttnMask,
-    embedding, layer_norm, linear, linear_no_bias, ops::softmax, seq, sequential,
+    Dropout, Embedding, Linear, Module, ModuleT, Sequential, VarBuilder, VarMap,
+    attention::AttnMask, embedding, layer_norm, linear, linear_no_bias, ops::softmax, seq,
+    sequential,
 };
 use core::f32;
 use std::{any::Any, fs::read_to_string};
@@ -68,7 +69,6 @@ struct MultiHeadAttention {
     d_in: usize,
     d_out: usize,
     context_length: usize,
-    train_mode: bool,
 }
 
 impl MultiHeadAttention {
@@ -97,12 +97,11 @@ impl MultiHeadAttention {
             d_out,
             context_length,
             mask,
-            train_mode: false,
         })
     }
 }
-impl Module for MultiHeadAttention {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+impl ModuleT for MultiHeadAttention {
+    fn forward_t(&self, xs: &Tensor, train_mode: bool) -> Result<Tensor> {
         let head_dims = self.d_out / self.num_heads;
         let (b, num_tokens, d_in) = xs.dims3()?;
         let queries = self.wq.forward(xs)?;
@@ -136,7 +135,7 @@ impl Module for MultiHeadAttention {
             &(atten_scores / (keys.dim(D::Minus1)? as f64).sqrt())?,
             D::Minus1,
         )?;
-        let attn_weights = self.dropout.forward(&attn_weights, self.train_mode)?;
+        let attn_weights = self.dropout.forward(&attn_weights, train_mode)?;
         let context_vec = &attn_weights.matmul(&values)?.transpose(1, 2)?;
 
         let context_vec = context_vec
@@ -153,7 +152,6 @@ struct TransfomerBlock {
     norm1: candle_nn::LayerNorm,
     norm2: candle_nn::LayerNorm,
     drop_shortcut: Dropout,
-    train_mode: bool,
 }
 impl TransfomerBlock {
     pub fn new(
@@ -169,22 +167,21 @@ impl TransfomerBlock {
             norm2: layer_norm(emb_dim, 1e-5, vs.pp("norm2"))?,
             drop_shortcut: Dropout::new(dropout),
             att: MultiHeadAttention::new(emb_dim, emb_dim, context_length, dropout, n_heads, vs)?,
-            train_mode: false,
         })
     }
 }
-impl Module for TransfomerBlock {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+impl ModuleT for TransfomerBlock {
+    fn forward_t(&self, x: &Tensor, train_mode: bool) -> Result<Tensor> {
         let shortcut = &x;
         let mut x = self.norm1.forward(&x)?;
-        x = self.att.forward(&x)?;
-        x = self.drop_shortcut.forward(&x, self.train_mode)?;
+        x = self.att.forward_t(&x, train_mode)?;
+        x = self.drop_shortcut.forward(&x, train_mode)?;
         x = x.broadcast_add(shortcut)?;
 
         let shortcut = &x;
         let mut x = self.norm2.forward(&x)?;
         x = self.ff.forward(&x)?;
-        x = self.drop_shortcut.forward(&x, self.train_mode)?;
+        x = self.drop_shortcut.forward(&x, train_mode)?;
         x = x.broadcast_add(&shortcut)?;
 
         Ok(x)
@@ -195,22 +192,24 @@ struct GPTModel {
     tok_emb: Embedding,
     pos_emb: Embedding,
     drop_emb: Dropout,
-    tranformers: Sequential,
+    tranformers: Vec<TransfomerBlock>,
     final_norm: candle_nn::LayerNorm,
     out_head: Linear,
-    train_mode: bool,
 }
 
-impl Module for GPTModel {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let (batch_size, seq_len) = xs.shape().dims2()?;
+impl ModuleT for GPTModel {
+    fn forward_t(&self, xs: &Tensor, train_mode: bool) -> Result<Tensor> {
+        let (_batch_size, seq_len) = xs.shape().dims2()?;
         let tok_embeds = self.tok_emb.forward(&xs)?;
         let pos_embeds = self
             .pos_emb
             .forward(&Tensor::arange(0, seq_len as u32, &xs.device())?)?;
         let mut x = tok_embeds.broadcast_add(&pos_embeds)?;
-        let x = self.drop_emb.forward(&x, self.train_mode)?;
-        let x = self.tranformers.forward(&x)?;
+        x = self.drop_emb.forward(&x, train_mode)?;
+
+        for block in &self.tranformers {
+            x = block.forward_t(&x, train_mode)?;
+        }
         let x = self.final_norm.forward(&x)?;
         let logits = self.out_head.forward(&x)?;
         Ok(logits)
@@ -227,9 +226,9 @@ impl GPTModel {
         drop_rate: f32,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let mut seq = seq();
+        let mut seq = vec![];
         for i in 0..n_layers {
-            seq = seq.add(TransfomerBlock::new(
+            seq.push(TransfomerBlock::new(
                 emb_dim,
                 context_length,
                 n_heads,
@@ -244,7 +243,6 @@ impl GPTModel {
             tranformers: seq,
             final_norm: layer_norm(emb_dim, 1e-5, vb.pp("final_norm"))?,
             out_head: linear_no_bias(emb_dim, vocab_size, vb.pp("out_head"))?,
-            train_mode: false,
         })
     }
 }
@@ -273,6 +271,35 @@ fn print_total_parameters(varmap: &VarMap) {
     println!("==========================================");
 }
 
+fn generate_text_simple(
+    model: &GPTModel,
+    mut idx: Tensor,
+    max_new_tokens: usize,
+    context_size: usize,
+) -> Result<Tensor> {
+    for _ in 0..max_new_tokens {
+        let (_batch_size, seq_len) = idx.dims2()?;
+
+        let idx_cond = if seq_len > context_size {
+            idx.i((0.., (seq_len - context_size)..))?
+        } else {
+            idx.clone()
+        };
+        let logits = model.forward_t(&idx_cond, false)?;
+        let (_, cond_len, _) = logits.dims3()?;
+
+        let logits = logits.i((.., cond_len - 1, ..))?;
+        let probas = softmax(&logits, D::Minus1)?;
+        let idx_next = probas.argmax_keepdim(D::Minus1)?;
+        idx = Tensor::cat(&[&idx, &idx_next], 1)?;
+    }
+    Ok(idx)
+}
+
+struct DataSet {
+    input_ids: Vec<u32>,
+    target_ids: Vec<u32>,
+}
 pub fn main() {
     let tokenizer = r50k_base_singleton();
 
@@ -280,7 +307,7 @@ pub fn main() {
     let tokens = tokenizer.encode_with_special_tokens(&text);
 
     let vocab_size = 50257;
-    let context_length = 1024;
+    let context_length = 256; //1024;
     let emb_dim = 768;
     let n_heads = 12;
     let n_layers = 12;
@@ -307,6 +334,10 @@ pub fn main() {
         .unwrap()
         .reshape((1, n))
         .unwrap();
-    let s = gpt.forward(&x).unwrap();
-    println!("{}", s);
+    println!("{}", &x);
+    let y = generate_text_simple(&gpt, x, 6, context_length).unwrap();
+    let y = y.squeeze(0).unwrap().to_vec1().unwrap();
+    let output = tokenizer.decode(&y).unwrap();
+
+    println!("{}", &output);
 }
