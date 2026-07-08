@@ -1,8 +1,8 @@
 use candle_core::{D, DType, Device, IndexOp, Result, Tensor, Var};
 use candle_nn::{
-    Dropout, Embedding, Linear, Module, ModuleT, Sequential, VarBuilder, VarMap,
-    attention::AttnMask, embedding, layer_norm, linear, linear_no_bias, ops::softmax, seq,
-    sequential,
+    AdamW, Dropout, Embedding, Linear, Module, ModuleT, Optimizer, ParamsAdamW, Sequential,
+    VarBuilder, VarMap, attention::AttnMask, embedding, layer_norm, linear, linear_no_bias,
+    loss::cross_entropy, ops::softmax, seq, sequential,
 };
 use core::f32;
 use std::{any::Any, fs::read_to_string};
@@ -246,6 +246,39 @@ impl GPTModel {
         })
     }
 }
+
+fn get_batch(
+    tokens: &[u32],
+    batch_idx: usize,
+    batch_size: usize,
+    max_length: usize,
+    stride: usize,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let mut inputs = Vec::new();
+    let mut targets = Vec::new();
+
+    for b in 0..batch_size {
+        // Calculate where this specific batch element starts based on stride
+        let start_pos = (batch_idx * batch_size + b) * stride;
+
+        // Extract the input chunk (length of max_length)
+        let input_chunk = tokens[start_pos..start_pos + max_length].to_vec();
+
+        // Extract the target chunk (shifted right by 1 token!)
+        let target_chunk = tokens[start_pos + 1..start_pos + max_length + 1].to_vec();
+
+        inputs.extend(input_chunk);
+        targets.extend(target_chunk);
+    }
+
+    // Create the final [batch_size, max_length] tensors
+    let x = Tensor::from_vec(inputs, (batch_size, max_length), device)?;
+    let y = Tensor::from_vec(targets, (batch_size, max_length), device)?;
+
+    Ok((x, y))
+}
+
 fn print_total_parameters(varmap: &VarMap) {
     let mut total_params = 0;
 
@@ -296,9 +329,14 @@ fn generate_text_simple(
     Ok(idx)
 }
 
-struct DataSet {
-    input_ids: Vec<u32>,
-    target_ids: Vec<u32>,
+fn calc_loss_batch(
+    input_batch: &Tensor,
+    target_batch: &Tensor,
+    model: &GPTModel,
+) -> Result<Tensor> {
+    let logits = model.forward_t(&input_batch, false)?;
+    let loss = cross_entropy(&logits.flatten(0, 1)?, &target_batch.flatten_all()?)?;
+    Ok(loss)
 }
 pub fn main() {
     let tokenizer = r50k_base_singleton();
@@ -328,16 +366,65 @@ pub fn main() {
     )
     .unwrap();
     print_total_parameters(&varmap);
-    let tokens = tokenizer.encode_with_special_tokens("Hello, I am");
-    let n = tokens.len();
-    let x = Tensor::new(tokens, &device)
-        .unwrap()
-        .reshape((1, n))
-        .unwrap();
-    println!("{}", &x);
-    let y = generate_text_simple(&gpt, x, 6, context_length).unwrap();
-    let y = y.squeeze(0).unwrap().to_vec1().unwrap();
-    let output = tokenizer.decode(&y).unwrap();
+    let batch_size = 2;
+    let stride = context_length;
 
-    println!("{}", &output);
+    let train_ratio = 0.9;
+    let split_idx = (train_ratio * tokens.len() as f32) as usize;
+    let train_data = &tokens[0..split_idx];
+    let val_data = &tokens[split_idx..];
+
+    let num_train_batches = (train_data.len() - context_length) / (batch_size * stride);
+    let mut total_loss = 0.0f32;
+    let params = ParamsAdamW {
+        lr: 0.0004,
+        ..Default::default()
+    };
+    let mut opt = AdamW::new(varmap.all_vars(), params).unwrap();
+
+    for epoch in 0..10 {
+        let mut total_epoch_loss = 0.0f32;
+        for i in 0..num_train_batches {
+            let (x, y) =
+                get_batch(&train_data, i, batch_size, context_length, stride, &device).unwrap();
+
+            let logits = gpt.forward_t(&x, true).unwrap();
+            let loss =
+                cross_entropy(&logits.flatten(0, 1).unwrap(), &y.flatten_all().unwrap()).unwrap();
+            opt.backward_step(&loss).unwrap();
+            let loss_val = loss.to_scalar::<f32>().unwrap();
+            total_epoch_loss += loss_val;
+            if i % 2 == 0 {
+                println!(
+                    "Epoch {}, Batch {}/ {} - Loss {:.4}",
+                    epoch + 1,
+                    i,
+                    num_train_batches,
+                    loss_val
+                );
+            }
+        }
+        let avg_epoch_loss = total_epoch_loss / (num_train_batches as f32);
+        println!(
+            "====> Epoch {} Complete! Average Loss: {:.4}",
+            epoch + 1,
+            avg_epoch_loss
+        );
+        // Put this at the bottom of your epoch loop to watch it learn live!
+
+        let sample_tokens = tokenizer.encode_with_special_tokens("Hello, I am").to_vec();
+        let len = sample_tokens.len();
+        let sample_input = Tensor::from_vec(sample_tokens, (1, len), &device).unwrap();
+        let generated_tokens =
+            generate_text_simple(&gpt, sample_input, 15, context_length).unwrap();
+
+        // Flatten down to a 1D vector to decode back to a string
+        let token_ids: Vec<u32> = generated_tokens.flatten_all().unwrap().to_vec1().unwrap();
+        // let generated_text = tokenizer.decode(&token_ids).unwrap();
+
+        println!("--- Epoch {} Sample Generation: ---", epoch + 1);
+        // println!("{}\n-----------------------------------", generated_text);
+    }
+
+    // get_batch(&train_data, 0, 2, context_length, stride, &device);
 }
