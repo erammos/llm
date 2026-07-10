@@ -1,14 +1,14 @@
 use candle_core::{D, DType, Device, IndexOp, Result, Tensor, Var};
 use candle_nn::{
     AdamW, Dropout, Embedding, Linear, Module, ModuleT, Optimizer, ParamsAdamW, Sequential,
-    VarBuilder, VarMap, attention::AttnMask, embedding, layer_norm, linear, linear_no_bias,
+    VarBuilder, VarMap, attention::AttnMask, embedding, linear, linear_no_bias,
     loss::cross_entropy, ops::softmax, seq, sequential,
 };
 use core::f32;
 use std::{any::Any, fs::read_to_string};
 use tiktoken_rs::{r50k_base, r50k_base_singleton, tokenizer};
 
-/* struct LayerNorm {
+struct LayerNorm {
     eps: f64,
     scale: Tensor,
     shift: Tensor,
@@ -36,7 +36,6 @@ impl Module for LayerNorm {
         scaled.broadcast_add(&self.shift)
     }
 }
-*/
 
 struct FeedForward {
     l1: Linear,
@@ -149,8 +148,8 @@ impl ModuleT for MultiHeadAttention {
 struct TransfomerBlock {
     att: MultiHeadAttention,
     ff: FeedForward,
-    norm1: candle_nn::LayerNorm,
-    norm2: candle_nn::LayerNorm,
+    norm1: LayerNorm,
+    norm2: LayerNorm,
     drop_shortcut: Dropout,
 }
 impl TransfomerBlock {
@@ -163,8 +162,8 @@ impl TransfomerBlock {
     ) -> Result<Self> {
         Ok(Self {
             ff: FeedForward::new(emb_dim, vs.pp("ff"))?,
-            norm1: layer_norm(emb_dim, 1e-5, vs.pp("norm1"))?,
-            norm2: layer_norm(emb_dim, 1e-5, vs.pp("norm2"))?,
+            norm1: LayerNorm::new(emb_dim, vs.pp("norm1"))?,
+            norm2: LayerNorm::new(emb_dim, vs.pp("norm2"))?,
             drop_shortcut: Dropout::new(dropout),
             att: MultiHeadAttention::new(emb_dim, emb_dim, context_length, dropout, n_heads, vs)?,
         })
@@ -193,7 +192,7 @@ struct GPTModel {
     pos_emb: Embedding,
     drop_emb: Dropout,
     tranformers: Vec<TransfomerBlock>,
-    final_norm: candle_nn::LayerNorm,
+    final_norm: LayerNorm,
     out_head: Linear,
 }
 
@@ -241,7 +240,7 @@ impl GPTModel {
             pos_emb: embedding(context_length, emb_dim, vb.pp("pos_enb"))?,
             drop_emb: Dropout::new(drop_rate),
             tranformers: seq,
-            final_norm: layer_norm(emb_dim, 1e-5, vb.pp("final_norm"))?,
+            final_norm: LayerNorm::new(emb_dim, vb.pp("final_norm"))?,
             out_head: linear_no_bias(emb_dim, vocab_size, vb.pp("out_head"))?,
         })
     }
@@ -345,14 +344,14 @@ pub fn main() {
     let tokens = tokenizer.encode_with_special_tokens(&text);
 
     let vocab_size = 50257;
-    let context_length = 256; //1024;
+    let context_length = 256;
     let emb_dim = 768;
     let n_heads = 12;
     let n_layers = 12;
     let drop_rate = 0.1;
 
     let device = Device::Cpu;
-    let varmap = VarMap::new();
+    let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
     let gpt = GPTModel::new(
@@ -378,11 +377,14 @@ pub fn main() {
     let mut total_loss = 0.0f32;
     let params = ParamsAdamW {
         lr: 0.0004,
+        weight_decay: 0.1,
         ..Default::default()
     };
     let mut opt = AdamW::new(varmap.all_vars(), params).unwrap();
 
-    for epoch in 0..10 {
+    varmap.load("mymodel2").unwrap();
+    /*
+    for epoch in 0..30 {
         let mut total_epoch_loss = 0.0f32;
         for i in 0..num_train_batches {
             let (x, y) =
@@ -426,5 +428,19 @@ pub fn main() {
         // println!("{}\n-----------------------------------", generated_text);
     }
 
+    varmap.save("mymodel2").unwrap();
+    */
     // get_batch(&train_data, 0, 2, context_length, stride, &device);
+
+    let sample_tokens = tokenizer
+        .encode_with_special_tokens("Who is Jack Gisburn?")
+        .to_vec();
+    let len = sample_tokens.len();
+    let sample_input = Tensor::from_vec(sample_tokens, (1, len), &device).unwrap();
+    let generated_tokens = generate_text_simple(&gpt, sample_input, 15, context_length).unwrap();
+
+    // Flatten down to a 1D vector to decode back to a string
+    let token_ids: Vec<u32> = generated_tokens.flatten_all().unwrap().to_vec1().unwrap();
+    let generated_text = tokenizer.decode(&token_ids).unwrap();
+    println!("{}", generated_text);
 }
